@@ -50,7 +50,7 @@ func TestHandler_ExecuteSql_NotImplemented(t *testing.T) {
 		t.Errorf("status: got %d, want 404", w.Code)
 	}
 	resp := decodeError(t, w)
-	if resp.Code != "NotFoundException" {
+	if resp.Code != ErrNotFound {
 		t.Errorf("code: got %q, want NotFoundException", resp.Code)
 	}
 }
@@ -80,7 +80,7 @@ func TestHandler_CommitTransaction_UnknownTransactionId(t *testing.T) {
 		t.Errorf("status: got %d, want 400", w.Code)
 	}
 	resp := decodeError(t, w)
-	if resp.Code != "BadRequestException" {
+	if resp.Code != ErrBadRequest {
 		t.Errorf("code: got %q, want BadRequestException", resp.Code)
 	}
 }
@@ -111,7 +111,7 @@ func TestHandler_Execute_UnknownTransactionId(t *testing.T) {
 		t.Errorf("status: got %d, want 400", w.Code)
 	}
 	resp := decodeError(t, w)
-	if resp.Code != "BadRequestException" {
+	if resp.Code != ErrBadRequest {
 		t.Errorf("code: got %q, want BadRequestException", resp.Code)
 	}
 }

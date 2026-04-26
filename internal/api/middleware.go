@@ -15,7 +15,7 @@ func handleJSON[T any](fn func(context.Context, T) (any, error)) http.HandlerFun
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req T
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "BadRequestException", "invalid request body: "+err.Error())
+			writeError(w, http.StatusBadRequest, ErrBadRequest, "invalid request body: "+err.Error())
 			return
 		}
 
@@ -25,7 +25,7 @@ func handleJSON[T any](fn func(context.Context, T) (any, error)) http.HandlerFun
 			if errors.As(err, &apiErr) {
 				writeError(w, apiErr.Status, apiErr.Code, apiErr.Message)
 			} else {
-				writeError(w, http.StatusBadRequest, "BadRequestException", err.Error())
+				writeError(w, http.StatusBadRequest, ErrBadRequest, err.Error())
 			}
 			return
 		}

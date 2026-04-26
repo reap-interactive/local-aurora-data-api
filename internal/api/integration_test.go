@@ -60,7 +60,7 @@ func testSecretArn() string {
 
 // apiPost sends a POST request to path on the test server and decodes the
 // response body into dest (if non-nil). Returns the HTTP status code.
-func apiPost(t *testing.T, srv *httptest.Server, path string, body interface{}, dest interface{}) int {
+func apiPost(t *testing.T, srv *httptest.Server, path string, body any, dest any) int {
 	t.Helper()
 	b, _ := json.Marshal(body)
 	resp, err := http.Post(srv.URL+path, "application/json", bytes.NewReader(b))
@@ -82,7 +82,7 @@ func testTable(t *testing.T, srv *httptest.Server, ddl string, fn func()) {
 	status := apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 		ResourceArn: testResourceArn(),
 		SecretArn:   testSecretArn(),
-		Sql:         ddl,
+		SQL:         ddl,
 	}, nil)
 	if status != http.StatusOK {
 		t.Fatalf("create table: status %d", status)
@@ -93,7 +93,7 @@ func testTable(t *testing.T, srv *httptest.Server, ddl string, fn func()) {
 		apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 			ResourceArn: testResourceArn(),
 			SecretArn:   testSecretArn(),
-			Sql:         "DROP TABLE IF EXISTS " + name,
+			SQL:         "DROP TABLE IF EXISTS " + name,
 		}, nil)
 	})
 	fn()
@@ -108,7 +108,7 @@ func TestIntegration_SelectOne(t *testing.T) {
 	status := apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 		ResourceArn: testResourceArn(),
 		SecretArn:   testSecretArn(),
-		Sql:         "SELECT 1 AS n",
+		SQL:         "SELECT 1 AS n",
 	}, &resp)
 
 	if status != http.StatusOK {
@@ -130,7 +130,7 @@ func TestIntegration_SelectWithMetadata(t *testing.T) {
 	status := apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 		ResourceArn:           testResourceArn(),
 		SecretArn:             testSecretArn(),
-		Sql:                   "SELECT 42::int4 AS answer",
+		SQL:                   "SELECT 42::int4 AS answer",
 		IncludeResultMetadata: true,
 	}, &resp)
 
@@ -152,7 +152,7 @@ func TestIntegration_SelectFormattedRecords(t *testing.T) {
 	status := apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 		ResourceArn:     testResourceArn(),
 		SecretArn:       testSecretArn(),
-		Sql:             "SELECT 1 AS id, 'alice' AS name",
+		SQL:             "SELECT 1 AS id, 'alice' AS name",
 		FormatRecordsAs: "JSON",
 	}, &resp)
 
@@ -162,7 +162,7 @@ func TestIntegration_SelectFormattedRecords(t *testing.T) {
 	if resp.FormattedRecords == "" {
 		t.Fatal("formattedRecords should not be empty")
 	}
-	var rows []map[string]interface{}
+	var rows []map[string]any
 	if err := json.Unmarshal([]byte(resp.FormattedRecords), &rows); err != nil {
 		t.Fatalf("parse formattedRecords: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestIntegration_InsertAndSelect(t *testing.T) {
 		status := apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 			ResourceArn: testResourceArn(),
 			SecretArn:   testSecretArn(),
-			Sql:         "INSERT INTO " + tableName + " (val) VALUES (:val)",
+			SQL:         "INSERT INTO " + tableName + " (val) VALUES (:val)",
 			Parameters:  []dataapi.SQLParameter{{Name: "val", Value: dataapi.StringField("hello")}},
 		}, &insertResp)
 
@@ -197,7 +197,7 @@ func TestIntegration_InsertAndSelect(t *testing.T) {
 		apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 			ResourceArn: testResourceArn(),
 			SecretArn:   testSecretArn(),
-			Sql:         "SELECT val FROM " + tableName,
+			SQL:         "SELECT val FROM " + tableName,
 		}, &selResp)
 
 		if len(selResp.Records) != 1 {
@@ -224,7 +224,7 @@ func TestIntegration_TransactionCommit(t *testing.T) {
 		}, &beginResp); s != http.StatusOK {
 			t.Fatalf("BeginTransaction status: %d", s)
 		}
-		txID := beginResp.TransactionId
+		txID := beginResp.TransactionID
 		if txID == "" {
 			t.Fatal("empty transactionId")
 		}
@@ -232,15 +232,15 @@ func TestIntegration_TransactionCommit(t *testing.T) {
 		apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 			ResourceArn:   testResourceArn(),
 			SecretArn:     testSecretArn(),
-			Sql:           "INSERT INTO " + tableName + " (val) VALUES (99)",
-			TransactionId: txID,
+			SQL:           "INSERT INTO " + tableName + " (val) VALUES (99)",
+			TransactionID: txID,
 		}, nil)
 
 		var commitResp dataapi.CommitTransactionResponse
 		if s := apiPost(t, srv, "/CommitTransaction", dataapi.CommitTransactionRequest{
 			ResourceArn:   testResourceArn(),
 			SecretArn:     testSecretArn(),
-			TransactionId: txID,
+			TransactionID: txID,
 		}, &commitResp); s != http.StatusOK {
 			t.Fatalf("CommitTransaction status: %d", s)
 		}
@@ -252,7 +252,7 @@ func TestIntegration_TransactionCommit(t *testing.T) {
 		apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 			ResourceArn: testResourceArn(),
 			SecretArn:   testSecretArn(),
-			Sql:         "SELECT val FROM " + tableName,
+			SQL:         "SELECT val FROM " + tableName,
 		}, &selResp)
 
 		if len(selResp.Records) != 1 {
@@ -275,15 +275,15 @@ func TestIntegration_TransactionRollback(t *testing.T) {
 		apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 			ResourceArn:   testResourceArn(),
 			SecretArn:     testSecretArn(),
-			Sql:           "INSERT INTO " + tableName + " (val) VALUES (42)",
-			TransactionId: beginResp.TransactionId,
+			SQL:           "INSERT INTO " + tableName + " (val) VALUES (42)",
+			TransactionID: beginResp.TransactionID,
 		}, nil)
 
 		var rollbackResp dataapi.RollbackTransactionResponse
 		if s := apiPost(t, srv, "/RollbackTransaction", dataapi.RollbackTransactionRequest{
 			ResourceArn:   testResourceArn(),
 			SecretArn:     testSecretArn(),
-			TransactionId: beginResp.TransactionId,
+			TransactionID: beginResp.TransactionID,
 		}, &rollbackResp); s != http.StatusOK {
 			t.Fatalf("RollbackTransaction status: %d", s)
 		}
@@ -295,7 +295,7 @@ func TestIntegration_TransactionRollback(t *testing.T) {
 		apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 			ResourceArn: testResourceArn(),
 			SecretArn:   testSecretArn(),
-			Sql:         "SELECT val FROM " + tableName,
+			SQL:         "SELECT val FROM " + tableName,
 		}, &selResp)
 
 		if len(selResp.Records) != 0 {
@@ -315,7 +315,7 @@ func TestIntegration_BatchExecute(t *testing.T) {
 		status := apiPost(t, srv, "/BatchExecute", dataapi.BatchExecuteStatementRequest{
 			ResourceArn: testResourceArn(),
 			SecretArn:   testSecretArn(),
-			Sql:         "INSERT INTO " + tableName + " (val) VALUES (:v)",
+			SQL:         "INSERT INTO " + tableName + " (val) VALUES (:v)",
 			ParameterSets: [][]dataapi.SQLParameter{
 				{{Name: "v", Value: dataapi.LongField(10)}},
 				{{Name: "v", Value: dataapi.LongField(20)}},
@@ -334,7 +334,7 @@ func TestIntegration_BatchExecute(t *testing.T) {
 		apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 			ResourceArn: testResourceArn(),
 			SecretArn:   testSecretArn(),
-			Sql:         "SELECT val FROM " + tableName + " ORDER BY val",
+			SQL:         "SELECT val FROM " + tableName + " ORDER BY val",
 		}, &selResp)
 
 		if len(selResp.Records) != 3 {
@@ -351,7 +351,7 @@ func TestIntegration_InvalidSQL(t *testing.T) {
 	status := apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 		ResourceArn: testResourceArn(),
 		SecretArn:   testSecretArn(),
-		Sql:         "THIS IS NOT SQL",
+		SQL:         "THIS IS NOT SQL",
 	}, nil)
 
 	if status != http.StatusBadRequest {
@@ -366,7 +366,7 @@ func TestIntegration_ParameterTypes(t *testing.T) {
 	status := apiPost(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
 		ResourceArn: testResourceArn(),
 		SecretArn:   testSecretArn(),
-		Sql:         "SELECT :n::int8 AS n, :s::text AS s, :b::bool AS b",
+		SQL:         "SELECT :n::int8 AS n, :s::text AS s, :b::bool AS b",
 		Parameters: []dataapi.SQLParameter{
 			{Name: "n", Value: dataapi.LongField(7)},
 			{Name: "s", Value: dataapi.StringField("world")},
