@@ -123,6 +123,12 @@ func ParseNamedParams(query string, params map[string]any) (string, []any, error
 				i++
 			}
 
+		// ── PostgreSQL cast operator (::) — must be checked before named param ─
+		case c == ':' && i+1 < n && query[i+1] == ':':
+			out.WriteByte(':')
+			out.WriteByte(':')
+			i += 2
+
 		// ── named parameter ───────────────────────────────────────────────────
 		case c == ':' && i+1 < n && isAlphaUnderscore(query[i+1]):
 			i++ // skip ':'

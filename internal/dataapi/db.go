@@ -1,31 +1,31 @@
 package dataapi
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// OpenPostgresDB creates a new *sql.DB connection pool for the given PostgreSQL
-// host/port/user/password/dbName combination using the pgx/v5 stdlib driver.
+// OpenPostgresDB creates a new *pgxpool.Pool connection pool for the given
+// PostgreSQL host/port/user/password/dbName combination.
 //
 // The connection string includes "sslmode=disable" for local development.
-func OpenPostgresDB(host, port, user, password, dbName string) (*sql.DB, error) {
+func OpenPostgresDB(host, port, user, password, dbName string) (*pgxpool.Pool, error) {
 	dsn := fmt.Sprintf(
 		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 		host, port, user, password, dbName,
 	)
 
-	db, err := sql.Open("pgx", dsn)
+	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
-		return nil, fmt.Errorf("sql.Open: %w", err)
+		return nil, fmt.Errorf("pgxpool.New: %w", err)
 	}
 
-	if err := db.Ping(); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("db.Ping: %w", err)
+	if err := pool.Ping(context.Background()); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("pool.Ping: %w", err)
 	}
 
-	return db, nil
+	return pool, nil
 }

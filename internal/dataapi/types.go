@@ -6,11 +6,67 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// awsTypeCode maps PostgreSQL type names (as returned by
-// (*sql.ColumnType).DatabaseTypeName()) to JDBC type codes. These are the
-// values the AWS Data API returns in ColumnMetadata.Type.
+// oidTypeName maps well-known PostgreSQL type OIDs to the short type-name
+// strings used throughout this package (makeScanDest, awsTypeCode, etc.).
+func oidTypeName(oid uint32) string {
+	switch oid {
+	case 16:
+		return "BOOL"
+	case 17:
+		return "BYTEA"
+	case 18:
+		return "CHAR"
+	case 20:
+		return "INT8"
+	case 21:
+		return "INT2"
+	case 23:
+		return "INT4"
+	case 25:
+		return "TEXT"
+	case 26:
+		return "OID"
+	case 28:
+		return "XID"
+	case 114:
+		return "JSON"
+	case 700:
+		return "FLOAT4"
+	case 701:
+		return "FLOAT8"
+	case 1042:
+		return "BPCHAR"
+	case 1043:
+		return "VARCHAR"
+	case 1082:
+		return "DATE"
+	case 1083:
+		return "TIME"
+	case 1114:
+		return "TIMESTAMP"
+	case 1184:
+		return "TIMESTAMPTZ"
+	case 1266:
+		return "TIMETZ"
+	case 1700:
+		return "NUMERIC"
+	case 2950:
+		return "UUID"
+	case 3802:
+		return "JSONB"
+	default:
+		return "TEXT"
+	}
+}
+
+// awsTypeCode maps PostgreSQL type names to JDBC type codes returned by the
+// AWS Data API in ColumnMetadata.Type.
 func awsTypeCode(typeName string) int {
 	switch strings.ToUpper(typeName) {
 	case "INT2":
@@ -55,41 +111,21 @@ func isSignedType(typeName string) bool {
 	return false
 }
 
-// columnMetadataFromType builds a ColumnMetadata entry from a *sql.ColumnType.
-func columnMetadataFromType(ct *sql.ColumnType) ColumnMetadata {
-	typeName := ct.DatabaseTypeName()
-	meta := ColumnMetadata{
-		Name:     ct.Name(),
-		Label:    ct.Name(),
+// columnMetadataFromField builds a ColumnMetadata entry from a pgconn.FieldDescription.
+func columnMetadataFromField(fd pgconn.FieldDescription) ColumnMetadata {
+	typeName := oidTypeName(fd.DataTypeOID)
+	return ColumnMetadata{
+		Name:     fd.Name,
+		Label:    fd.Name,
 		TypeName: typeName,
 		Type:     awsTypeCode(typeName),
 		IsSigned: isSignedType(typeName),
+		Nullable: 2, // columnNullableUnknown — FieldDescription carries no nullability info
 	}
-
-	if precision, scale, ok := ct.DecimalSize(); ok {
-		meta.Precision = int(precision)
-		meta.Scale = int(scale)
-	}
-
-	if length, ok := ct.Length(); ok && meta.Precision == 0 {
-		meta.Precision = int(length)
-	}
-
-	if nullable, ok := ct.Nullable(); ok {
-		if nullable {
-			meta.Nullable = 1 // columnNullable
-		} else {
-			meta.Nullable = 0 // columnNoNulls
-		}
-	} else {
-		meta.Nullable = 2 // columnNullableUnknown
-	}
-
-	return meta
 }
 
 // makeScanDest returns a pointer of the appropriate type for scanning a column.
-// Using typed scan destinations gives pgx the information it needs to return
+// Using typed scan destinations gives pgx the information it needs to produce
 // proper Go values rather than raw bytes.
 func makeScanDest(typeName string) any {
 	switch strings.ToUpper(typeName) {
@@ -101,8 +137,12 @@ func makeScanDest(typeName string) any {
 		return new(sql.NullBool)
 	case "BYTEA":
 		return new([]byte)
-	case "TIMESTAMP", "TIMESTAMPTZ", "DATE", "TIME", "TIMETZ":
+	case "TIMESTAMP", "TIMESTAMPTZ", "DATE":
 		return new(sql.NullTime)
+	case "TIME", "TIMETZ":
+		// pgtype.Time is the native pgx type for OID 1083/1266; sql.NullTime
+		// cannot receive the pgtype.Time struct that pgx decodes these to.
+		return new(pgtype.Time)
 	default:
 		return new(sql.NullString)
 	}
@@ -140,6 +180,14 @@ func destToField(dest any, typeName string) Field {
 			return NullField()
 		}
 		return StringField(formatTimeValue(v.Time, typeName))
+
+	case *pgtype.Time:
+		if !v.Valid {
+			return NullField()
+		}
+		// Microseconds since midnight → time.Time for formatting.
+		t := time.Time{}.Add(time.Duration(v.Microseconds) * time.Microsecond)
+		return StringField(formatTimeValue(t, typeName))
 
 	case *sql.NullString:
 		if !v.Valid {
@@ -197,34 +245,34 @@ func stripTrailingZeros(s string, removeDot bool) string {
 }
 
 // scanRowToFields scans the current row into a slice of Fields.
-func scanRowToFields(rows *sql.Rows, colTypes []*sql.ColumnType) ([]Field, error) {
-	dests := make([]any, len(colTypes))
-	for i, ct := range colTypes {
-		dests[i] = makeScanDest(ct.DatabaseTypeName())
+func scanRowToFields(rows pgx.Rows, descs []pgconn.FieldDescription) ([]Field, error) {
+	dests := make([]any, len(descs))
+	for i, fd := range descs {
+		dests[i] = makeScanDest(oidTypeName(fd.DataTypeOID))
 	}
 	if err := rows.Scan(dests...); err != nil {
 		return nil, fmt.Errorf("row scan: %w", err)
 	}
-	fields := make([]Field, len(colTypes))
+	fields := make([]Field, len(descs))
 	for i, dest := range dests {
-		fields[i] = destToField(dest, colTypes[i].DatabaseTypeName())
+		fields[i] = destToField(dest, oidTypeName(descs[i].DataTypeOID))
 	}
 	return fields, nil
 }
 
-// scanRowToMap scans the current row into a map[string]interface{} for the
+// scanRowToMap scans the current row into a map[string]any for the
 // formatRecordsAs=JSON path.
-func scanRowToMap(rows *sql.Rows, colTypes []*sql.ColumnType) (map[string]any, error) {
-	dests := make([]any, len(colTypes))
-	for i, ct := range colTypes {
-		dests[i] = makeScanDest(ct.DatabaseTypeName())
+func scanRowToMap(rows pgx.Rows, descs []pgconn.FieldDescription) (map[string]any, error) {
+	dests := make([]any, len(descs))
+	for i, fd := range descs {
+		dests[i] = makeScanDest(oidTypeName(fd.DataTypeOID))
 	}
 	if err := rows.Scan(dests...); err != nil {
 		return nil, fmt.Errorf("row scan: %w", err)
 	}
-	row := make(map[string]any, len(colTypes))
-	for i, ct := range colTypes {
-		row[ct.Name()] = destToNative(dests[i], ct.DatabaseTypeName())
+	row := make(map[string]any, len(descs))
+	for i, fd := range descs {
+		row[fd.Name] = destToNative(dests[i], oidTypeName(fd.DataTypeOID))
 	}
 	return row, nil
 }
@@ -257,6 +305,12 @@ func destToNative(dest any, typeName string) any {
 			return nil
 		}
 		return formatTimeValue(v.Time, typeName)
+	case *pgtype.Time:
+		if !v.Valid {
+			return nil
+		}
+		t := time.Time{}.Add(time.Duration(v.Microseconds) * time.Microsecond)
+		return formatTimeValue(t, typeName)
 	case *sql.NullString:
 		if !v.Valid {
 			return nil

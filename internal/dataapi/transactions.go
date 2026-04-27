@@ -1,36 +1,38 @@
 package dataapi
 
 import (
+	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/base64"
 	"fmt"
 	"sync"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // TransactionStore holds in-flight database transactions keyed by their ID.
-// A transaction is created by BeginTransaction and lives until CommitTransaction
-// or RollbackTransaction is called.
+// A transaction is created by Begin and lives until Commit or Rollback is called.
 type TransactionStore struct {
 	mu   sync.Mutex
-	txns map[string]*sql.Tx
+	txns map[string]pgx.Tx
 }
 
 // NewTransactionStore returns an empty TransactionStore.
 func NewTransactionStore() *TransactionStore {
-	return &TransactionStore{txns: make(map[string]*sql.Tx)}
+	return &TransactionStore{txns: make(map[string]pgx.Tx)}
 }
 
-// Begin starts a new transaction on db, stores it, and returns its ID.
-func (ts *TransactionStore) Begin(db *sql.DB) (string, error) {
-	tx, err := db.Begin()
+// Begin starts a new transaction on pool, stores it, and returns its ID.
+func (ts *TransactionStore) Begin(ctx context.Context, pool *pgxpool.Pool) (string, error) {
+	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
 	id, err := generateTransactionID()
 	if err != nil {
-		_ = tx.Rollback()
+		_ = tx.Rollback(ctx)
 		return "", fmt.Errorf("failed to generate transaction ID: %w", err)
 	}
 
@@ -42,7 +44,7 @@ func (ts *TransactionStore) Begin(db *sql.DB) (string, error) {
 }
 
 // Get retrieves the transaction for the given ID without removing it.
-func (ts *TransactionStore) Get(id string) (*sql.Tx, error) {
+func (ts *TransactionStore) Get(id string) (pgx.Tx, error) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	tx, ok := ts.txns[id]
@@ -53,7 +55,7 @@ func (ts *TransactionStore) Get(id string) (*sql.Tx, error) {
 }
 
 // Commit commits the transaction and removes it from the store.
-func (ts *TransactionStore) Commit(id string) error {
+func (ts *TransactionStore) Commit(ctx context.Context, id string) error {
 	ts.mu.Lock()
 	tx, ok := ts.txns[id]
 	if !ok {
@@ -62,11 +64,11 @@ func (ts *TransactionStore) Commit(id string) error {
 	}
 	delete(ts.txns, id)
 	ts.mu.Unlock()
-	return tx.Commit()
+	return tx.Commit(ctx)
 }
 
 // Rollback rolls back the transaction and removes it from the store.
-func (ts *TransactionStore) Rollback(id string) error {
+func (ts *TransactionStore) Rollback(ctx context.Context, id string) error {
 	ts.mu.Lock()
 	tx, ok := ts.txns[id]
 	if !ok {
@@ -75,7 +77,7 @@ func (ts *TransactionStore) Rollback(id string) error {
 	}
 	delete(ts.txns, id)
 	ts.mu.Unlock()
-	return tx.Rollback()
+	return tx.Rollback(ctx)
 }
 
 // generateTransactionID produces a 184-character random base64 string,

@@ -2,18 +2,18 @@ package dataapi
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
-// Querier abstracts the subset of *sql.DB / *sql.Tx that the executor needs,
-// allowing Execute and BatchExecute to work transparently in both auto-commit
-// and transactional contexts.
+// Querier abstracts the subset of *pgxpool.Pool / pgx.Tx that the executor
+// needs, allowing Execute and BatchExecute to work transparently in both
+// auto-commit and transactional contexts.
 type Querier interface {
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
 // Execute runs a single SQL statement and returns the Data API response.
@@ -28,44 +28,35 @@ func Execute(ctx context.Context, q Querier, req *ExecuteStatementRequest) (*Exe
 		return nil, err
 	}
 
-	rows, err := q.QueryContext(ctx, rewritten, args...)
+	rows, err := q.Query(ctx, rewritten, args...)
 	if err != nil {
 		return nil, fmt.Errorf("%w", err)
 	}
 	defer rows.Close()
 
-	colTypes, err := rows.ColumnTypes()
-	if err != nil {
-		return nil, fmt.Errorf("column types: %w", err)
-	}
-
+	descs := rows.FieldDescriptions()
 	resp := &ExecuteStatementResponse{}
 
-	if len(colTypes) == 0 {
-		// DML or DDL — exhaust the iterator then re-run via ExecContext to get
-		// RowsAffected, which database/sql does not expose from QueryContext.
+	if len(descs) == 0 {
+		// DML or DDL — drain, then read CommandTag for RowsAffected.
+		// This avoids the double-execution bug that occurred when using
+		// ExecContext as a second call after QueryContext.
 		for rows.Next() {
 		}
+		rows.Close()
 		if err := rows.Err(); err != nil {
 			return nil, err
 		}
-		rows.Close()
-
-		result, execErr := q.ExecContext(ctx, rewritten, args...)
-		if execErr != nil {
-			return nil, fmt.Errorf("%w", execErr)
-		}
-		n, _ := result.RowsAffected()
-		resp.NumberOfRecordsUpdated = n
+		resp.NumberOfRecordsUpdated = rows.CommandTag().RowsAffected()
 		resp.GeneratedFields = []Field{}
 		return resp, nil
 	}
 
 	// SELECT / RETURNING path
 	if req.IncludeResultMetadata {
-		meta := make([]ColumnMetadata, len(colTypes))
-		for i, ct := range colTypes {
-			meta[i] = columnMetadataFromType(ct)
+		meta := make([]ColumnMetadata, len(descs))
+		for i, fd := range descs {
+			meta[i] = columnMetadataFromField(fd)
 		}
 		resp.ColumnMetadata = meta
 	}
@@ -73,7 +64,7 @@ func Execute(ctx context.Context, q Querier, req *ExecuteStatementRequest) (*Exe
 	if req.FormatRecordsAs == "JSON" {
 		rowMaps := make([]map[string]any, 0)
 		for rows.Next() {
-			m, err := scanRowToMap(rows, colTypes)
+			m, err := scanRowToMap(rows, descs)
 			if err != nil {
 				return nil, err
 			}
@@ -90,7 +81,7 @@ func Execute(ctx context.Context, q Querier, req *ExecuteStatementRequest) (*Exe
 	} else {
 		records := make([][]Field, 0)
 		for rows.Next() {
-			fields, err := scanRowToFields(rows, colTypes)
+			fields, err := scanRowToFields(rows, descs)
 			if err != nil {
 				return nil, err
 			}
@@ -121,21 +112,16 @@ func BatchExecute(ctx context.Context, q Querier, req *BatchExecuteStatementRequ
 			return nil, err
 		}
 
-		rows, err := q.QueryContext(ctx, rewritten, args...)
+		rows, err := q.Query(ctx, rewritten, args...)
 		if err != nil {
 			return nil, fmt.Errorf("%w", err)
 		}
 
-		colTypes, err := rows.ColumnTypes()
-		if err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("column types: %w", err)
-		}
-
+		descs := rows.FieldDescriptions()
 		var genFields []Field
-		if len(colTypes) > 0 {
+		if len(descs) > 0 {
 			for rows.Next() {
-				fields, err := scanRowToFields(rows, colTypes)
+				fields, err := scanRowToFields(rows, descs)
 				if err != nil {
 					rows.Close()
 					return nil, err
@@ -161,7 +147,7 @@ func BatchExecute(ctx context.Context, q Querier, req *BatchExecuteStatementRequ
 	return &BatchExecuteStatementResponse{UpdateResults: results}, nil
 }
 
-// buildParamMap converts a []SqlParameter into the map[string]interface{} that
+// buildParamMap converts a []SQLParameter into the map[string]any that
 // ParseNamedParams expects, applying any typeHint conversions.
 func buildParamMap(params []SQLParameter) (map[string]any, error) {
 	if len(params) == 0 {
