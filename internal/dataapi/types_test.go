@@ -182,7 +182,7 @@ func TestValueToField_SameTime_TimestampVsTimestamptz_UTCNormalisation(t *testin
 	loc := time.FixedZone("UTC+5", 5*60*60)
 	ts := time.Date(2024, 3, 15, 10, 20, 30, 0, loc) // 10:20:30 UTC+5 = 05:20:30 UTC
 
-	noTZ := valueToField(ts, "TIMESTAMP")   // keeps wall clock: 10:20:30
+	noTZ := valueToField(ts, "TIMESTAMP")     // keeps wall clock: 10:20:30
 	withTZ := valueToField(ts, "TIMESTAMPTZ") // normalises to UTC: 05:20:30
 
 	if noTZ.StringValue == nil || withTZ.StringValue == nil {
@@ -383,7 +383,7 @@ func TestNativeValue_SameTime_TimestampVsTimestamptz_UTCNormalisation(t *testing
 	// Non-UTC input so TIMESTAMPTZ (UTC-normalised) != TIMESTAMP (wall clock).
 	loc := time.FixedZone("UTC+5", 5*60*60)
 	ts := time.Date(2024, 3, 15, 10, 20, 30, 0, loc)
-	noTZ := nativeValue(ts, "TIMESTAMP")   // 10:20:30 wall clock
+	noTZ := nativeValue(ts, "TIMESTAMP")     // 10:20:30 wall clock
 	withTZ := nativeValue(ts, "TIMESTAMPTZ") // 05:20:30 UTC
 	if noTZ == withTZ {
 		t.Errorf("non-UTC input: TIMESTAMP and TIMESTAMPTZ must produce different values, both = %q", noTZ)
@@ -590,11 +590,21 @@ func TestAwsTypeCode(t *testing.T) {
 		pg   string
 		code int
 	}{
-		{"INT4", 4}, {"INT8", -5}, {"INT2", 5},
-		{"FLOAT8", 8}, {"BOOL", 16}, {"TEXT", 12},
-		{"BYTEA", -2}, {"TIMESTAMP", 93}, {"TIMESTAMPTZ", -101},
-		{"DATE", 91}, {"TIME", 92}, {"TIMETZ", -102},
-		{"UUID", 12}, {"JSONB", 12}, {"UNKNOWN_TYPE", 12},
+		{"INT4", 4},
+		{"INT8", -5},
+		{"INT2", 5},
+		{"FLOAT8", 8},
+		{"BOOL", 16},
+		{"TEXT", 12},
+		{"BYTEA", -2},
+		{"TIMESTAMP", 93},
+		{"TIMESTAMPTZ", -101},
+		{"DATE", 91},
+		{"TIME", 92},
+		{"TIMETZ", -102},
+		{"UUID", 12},
+		{"JSONB", 12},
+		{"UNKNOWN_TYPE", 12},
 	}
 	for _, tt := range tests {
 		if got := awsTypeCode(tt.pg); got != tt.code {
@@ -610,11 +620,20 @@ func TestOidTypeName_ArrayOIDs(t *testing.T) {
 		oid  uint32
 		want string
 	}{
-		{1009, "_TEXT"}, {1015, "_VARCHAR"}, {1007, "_INT4"},
-		{1016, "_INT8"}, {1005, "_INT2"}, {1021, "_FLOAT4"},
-		{1022, "_FLOAT8"}, {1000, "_BOOL"}, {1182, "_DATE"},
-		{1115, "_TIMESTAMP"}, {1185, "_TIMESTAMPTZ"}, {1231, "_NUMERIC"},
-		{2951, "_UUID"}, {3807, "_JSONB"},
+		{1009, "_TEXT"},
+		{1015, "_VARCHAR"},
+		{1007, "_INT4"},
+		{1016, "_INT8"},
+		{1005, "_INT2"},
+		{1021, "_FLOAT4"},
+		{1022, "_FLOAT8"},
+		{1000, "_BOOL"},
+		{1182, "_DATE"},
+		{1115, "_TIMESTAMP"},
+		{1185, "_TIMESTAMPTZ"},
+		{1231, "_NUMERIC"},
+		{2951, "_UUID"},
+		{3807, "_JSONB"},
 	}
 	for _, tt := range tests {
 		if got := oidTypeName(tt.oid); got != tt.want {
@@ -638,9 +657,6 @@ func makeNumeric(t *testing.T, intStr string, exp int32) pgtype.Numeric {
 }
 
 func contains(s, substr string) bool { return len(s) >= len(substr) && indexString(s, substr) >= 0 }
-func hasSuffix(s, suffix string) bool {
-	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
-}
 func indexString(s, sub string) int {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
