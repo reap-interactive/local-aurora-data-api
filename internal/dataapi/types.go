@@ -1,7 +1,6 @@
 package dataapi
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -13,7 +12,7 @@ import (
 )
 
 // oidTypeName maps well-known PostgreSQL type OIDs to the short type-name
-// strings used throughout this package (makeScanDest, awsTypeCode, etc.).
+// strings used throughout this package (valueToField, awsTypeCode, etc.).
 func oidTypeName(oid uint32) string {
 	switch oid {
 	case 16:
@@ -60,6 +59,42 @@ func oidTypeName(oid uint32) string {
 		return "UUID"
 	case 3802:
 		return "JSONB"
+
+	// Array types — name is "_" + element type name.
+	// OIDs from pg_type where typtype='b' and typelem != 0.
+	case 199:
+		return "_JSON"
+	case 1000:
+		return "_BOOL"
+	case 1002:
+		return "_BPCHAR"
+	case 1005:
+		return "_INT2"
+	case 1007:
+		return "_INT4"
+	case 1009:
+		return "_TEXT"
+	case 1015:
+		return "_VARCHAR"
+	case 1016:
+		return "_INT8"
+	case 1021:
+		return "_FLOAT4"
+	case 1022:
+		return "_FLOAT8"
+	case 1115:
+		return "_TIMESTAMP"
+	case 1182:
+		return "_DATE"
+	case 1185:
+		return "_TIMESTAMPTZ"
+	case 1231:
+		return "_NUMERIC"
+	case 2951:
+		return "_UUID"
+	case 3807:
+		return "_JSONB"
+
 	default:
 		return "TEXT"
 	}
@@ -124,89 +159,324 @@ func columnMetadataFromField(fd pgconn.FieldDescription) ColumnMetadata {
 	}
 }
 
-// makeScanDest returns a pointer of the appropriate type for scanning a column.
-// Using typed scan destinations gives pgx the information it needs to produce
-// proper Go values rather than raw bytes.
-func makeScanDest(typeName string) any {
-	switch strings.ToUpper(typeName) {
-	case "INT2", "INT4", "INT8", "OID", "XID":
-		return new(sql.NullInt64)
-	case "FLOAT4", "FLOAT8":
-		return new(sql.NullFloat64)
-	case "BOOL":
-		return new(sql.NullBool)
-	case "BYTEA":
-		return new([]byte)
-	case "TIMESTAMP", "TIMESTAMPTZ", "DATE":
-		return new(sql.NullTime)
-	case "TIME", "TIMETZ":
-		// pgtype.Time is the native pgx type for OID 1083/1266; sql.NullTime
-		// cannot receive the pgtype.Time struct that pgx decodes these to.
-		return new(pgtype.Time)
-	default:
-		return new(sql.NullString)
+// ── core conversion functions ─────────────────────────────────────────────────
+//
+// Both valueToField and nativeValue operate on the values returned by
+// rows.Values(), which are decoded by pgx's registered codec for each OID.
+//
+// Timezone awareness — CRITICAL invariant:
+//   - TIMESTAMP (OID 1114): pgx decodes with .UTC(), so the time.Time has a
+//     UTC location.  The value must be formatted WITHOUT a timezone offset.
+//   - TIMESTAMPTZ (OID 1184): pgx decodes with time.Local (no .UTC() call),
+//     so the location equals time.Local.  The value must be normalised to UTC
+//     and formatted WITH a +00:00 suffix.
+//
+// In a server environment where time.Local == time.UTC, TIMESTAMP and
+// TIMESTAMPTZ produce time.Time values that are indistinguishable by
+// t.Location().  The typeName parameter (derived from the column OID) is the
+// ONLY reliable source of timezone awareness.  Never use t.Location() to
+// decide whether to add a timezone offset.
+
+// valueToField converts a pgx-decoded column value into an AWS Data API Field.
+// typeName must be the result of oidTypeName(fd.DataTypeOID) for the column.
+func valueToField(v any, typeName string) Field {
+	if v == nil {
+		return NullField()
 	}
-}
 
-// destToField converts a scan destination into the appropriate AWS Data API Field.
-func destToField(dest any, typeName string) Field {
-	switch v := dest.(type) {
-	case *sql.NullInt64:
-		if !v.Valid {
+	// JSON/JSONB columns are decoded by pgx into Go values (map, slice, scalar).
+	// Re-marshal to a JSON string so callers receive the raw text representation.
+	tn := strings.ToUpper(typeName)
+	if tn == "JSON" || tn == "JSONB" {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return StringField(fmt.Sprintf("%v", v))
+		}
+		return StringField(string(b))
+	}
+
+	switch val := v.(type) {
+	case pgtype.InfinityModifier:
+		// Returned by TIMESTAMP / TIMESTAMPTZ / DATE codecs for ±infinity.
+		if val > 0 {
+			return StringField("infinity")
+		}
+		return StringField("-infinity")
+
+	case bool:
+		return BoolField(val)
+
+	case int8:
+		return LongField(int64(val))
+	case int16:
+		return LongField(int64(val))
+	case int32:
+		return LongField(int64(val))
+	case int64:
+		return LongField(val)
+
+	case float32:
+		return DoubleField(float64(val))
+	case float64:
+		return DoubleField(val)
+
+	case string:
+		// Covers TEXT, VARCHAR, CHAR, UUID, NUMERIC (text fallback), and TIMETZ
+		// (OID 1266, not registered in pgx's default type map; arrives as raw
+		// text like "14:30:00+05:30", preserving the original offset).
+		return StringField(val)
+
+	case time.Time:
+		// typeName drives format: DATE → date only, TIMESTAMP → no offset,
+		// TIMESTAMPTZ → UTC-normalised with +00:00.  See timezone note above.
+		return StringField(formatTimeValue(val, typeName))
+
+	case pgtype.Time:
+		// TIME (OID 1083): microseconds since midnight, no date, no timezone.
+		// TIMETZ (OID 1266) is not registered in pgx and arrives as string above.
+		if !val.Valid {
 			return NullField()
 		}
-		return LongField(v.Int64)
-
-	case *sql.NullFloat64:
-		if !v.Valid {
-			return NullField()
-		}
-		return DoubleField(v.Float64)
-
-	case *sql.NullBool:
-		if !v.Valid {
-			return NullField()
-		}
-		return BoolField(v.Bool)
-
-	case *[]byte:
-		if *v == nil {
-			return NullField()
-		}
-		return BlobField(*v)
-
-	case *sql.NullTime:
-		if !v.Valid {
-			return NullField()
-		}
-		return StringField(formatTimeValue(v.Time, typeName))
-
-	case *pgtype.Time:
-		if !v.Valid {
-			return NullField()
-		}
-		// Microseconds since midnight → time.Time for formatting.
-		t := time.Time{}.Add(time.Duration(v.Microseconds) * time.Microsecond)
+		t := time.Time{}.Add(time.Duration(val.Microseconds) * time.Microsecond)
 		return StringField(formatTimeValue(t, typeName))
 
-	case *sql.NullString:
-		if !v.Valid {
-			return NullField()
-		}
-		return StringField(v.String)
+	case []byte:
+		// BYTEA: base64-encoded when JSON-serialised.
+		return BlobField(val)
+
+	case [16]byte:
+		// UUID is decoded as a raw [16]byte by pgx.
+		return StringField(formatUUID(val))
+
+	case pgtype.Numeric:
+		return StringField(numericToString(val))
+
+	case []any:
+		// PostgreSQL array, decoded by ArrayCodec.DecodeValue into []any where
+		// each element is the natural Go type for the element OID.
+		return Field{ArrayValue: arrayToField(val, typeName)}
 	}
 
-	return NullField()
+	// Fallback for pgtype extension types, custom domains, etc.
+	return StringField(fmt.Sprintf("%v", v))
+}
+
+// nativeValue converts a pgx-decoded column value to a JSON-serialisable Go
+// value for the formattedRecords output path.
+// typeName must be the result of oidTypeName(fd.DataTypeOID) for the column.
+func nativeValue(v any, typeName string) any {
+	if v == nil {
+		return nil
+	}
+
+	// JSON/JSONB: pgx has already unmarshalled the value; return it as-is so
+	// json.Marshal embeds it directly rather than double-encoding.
+	tn := strings.ToUpper(typeName)
+	if tn == "JSON" || tn == "JSONB" {
+		return v
+	}
+
+	switch val := v.(type) {
+	case pgtype.InfinityModifier:
+		if val > 0 {
+			return "infinity"
+		}
+		return "-infinity"
+
+	case bool:
+		return val
+
+	case int8:
+		return int64(val)
+	case int16:
+		return int64(val)
+	case int32:
+		return int64(val)
+	case int64:
+		return val
+
+	case float32:
+		return float64(val)
+	case float64:
+		return val
+
+	case string:
+		return val
+
+	case time.Time:
+		// typeName controls TZ formatting — see timezone note above.
+		return formatTimeValue(val, typeName)
+
+	case pgtype.Time:
+		if !val.Valid {
+			return nil
+		}
+		t := time.Time{}.Add(time.Duration(val.Microseconds) * time.Microsecond)
+		return formatTimeValue(t, typeName)
+
+	case []byte:
+		// BYTEA: return as []byte; json.Marshal will produce a base64 string.
+		return val
+
+	case [16]byte:
+		return formatUUID(val)
+
+	case pgtype.Numeric:
+		return numericToString(val)
+
+	case []any:
+		// Recursively convert each element, passing the element type name so
+		// that TIMESTAMP vs TIMESTAMPTZ distinctions are preserved inside arrays.
+		elemType := strings.TrimPrefix(typeName, "_")
+		result := make([]any, len(val))
+		for i, elem := range val {
+			result[i] = nativeValue(elem, elemType)
+		}
+		return result
+	}
+
+	return fmt.Sprintf("%v", v)
+}
+
+// arrayToField converts a []any of pgx-decoded array elements (as returned by
+// ArrayCodec.DecodeValue) into an *ArrayValue. typeName is the array OID name
+// (e.g. "_TIMESTAMP", "_TIMESTAMPTZ") and is used to format time elements
+// correctly — this is what preserves TIMESTAMP vs TIMESTAMPTZ distinction.
+func arrayToField(elements []any, typeName string) *ArrayValue {
+	av := &ArrayValue{}
+	elemType := strings.TrimPrefix(typeName, "_")
+
+	for _, elem := range elements {
+		if elem == nil {
+			// NULL array elements have no per-element null concept in ArrayValue;
+			// skip them rather than inserting a misleading zero value.
+			continue
+		}
+		switch val := elem.(type) {
+		case pgtype.InfinityModifier:
+			if val > 0 {
+				av.StringValues = append(av.StringValues, "infinity")
+			} else {
+				av.StringValues = append(av.StringValues, "-infinity")
+			}
+		case bool:
+			av.BooleanValues = append(av.BooleanValues, val)
+		case int8:
+			av.LongValues = append(av.LongValues, int64(val))
+		case int16:
+			av.LongValues = append(av.LongValues, int64(val))
+		case int32:
+			av.LongValues = append(av.LongValues, int64(val))
+		case int64:
+			av.LongValues = append(av.LongValues, val)
+		case float32:
+			av.DoubleValues = append(av.DoubleValues, float64(val))
+		case float64:
+			av.DoubleValues = append(av.DoubleValues, val)
+		case string:
+			av.StringValues = append(av.StringValues, val)
+		case time.Time:
+			// elemType is e.g. "TIMESTAMP" or "TIMESTAMPTZ" — drives TZ formatting.
+			av.StringValues = append(av.StringValues, formatTimeValue(val, elemType))
+		case pgtype.Time:
+			if val.Valid {
+				t := time.Time{}.Add(time.Duration(val.Microseconds) * time.Microsecond)
+				av.StringValues = append(av.StringValues, formatTimeValue(t, elemType))
+			}
+		case pgtype.Numeric:
+			av.StringValues = append(av.StringValues, numericToString(val))
+		case [16]byte:
+			av.StringValues = append(av.StringValues, formatUUID(val))
+		default:
+			// JSON objects/arrays and unknown extension types: marshal to string.
+			b, _ := json.Marshal(val)
+			av.StringValues = append(av.StringValues, string(b))
+		}
+	}
+	return av
+}
+
+// formatUUID formats a raw [16]byte UUID as a canonical lowercase hyphenated
+// string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
+func formatUUID(b [16]byte) string {
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// numericToString converts a pgtype.Numeric to its exact decimal string
+// representation (e.g. "123.456"), preserving full precision.
+func numericToString(n pgtype.Numeric) string {
+	if !n.Valid {
+		return "0"
+	}
+	if n.NaN {
+		return "NaN"
+	}
+	if n.InfinityModifier != pgtype.Finite {
+		if n.InfinityModifier > 0 {
+			return "Infinity"
+		}
+		return "-Infinity"
+	}
+	if n.Int == nil {
+		return "0"
+	}
+
+	s := n.Int.String() // decimal digits, possibly with leading "-"
+	exp := int(n.Exp)
+
+	switch {
+	case exp == 0:
+		return s
+	case exp > 0:
+		// Shift decimal point right: append zeros.
+		return s + strings.Repeat("0", exp)
+	default:
+		// exp < 0: insert decimal point.
+		neg := len(s) > 0 && s[0] == '-'
+		digits := s
+		if neg {
+			digits = s[1:]
+		}
+		dotPos := len(digits) + exp // position of decimal point from the left
+		var r string
+		switch {
+		case dotPos <= 0:
+			// All digits are to the right of the decimal point.
+			r = "0." + strings.Repeat("0", -dotPos) + digits
+		case dotPos < len(digits):
+			r = digits[:dotPos] + "." + digits[dotPos:]
+		default:
+			// dotPos >= len(digits): no fractional part needed.
+			r = digits + strings.Repeat("0", dotPos-len(digits))
+		}
+		if neg {
+			return "-" + r
+		}
+		return r
+	}
 }
 
 // formatTimeValue formats a time.Time according to the PostgreSQL type name,
-// matching AWS Data API conventions: trailing fractional zeros are stripped,
-// and TIMESTAMPTZ / TIMETZ values are normalised to UTC.
+// matching AWS Data API conventions.
+//
+// Timezone rules:
+//   - TIMESTAMP:   wall-clock value, no offset  → "2006-01-02 15:04:05[.ffffff]"
+//   - TIMESTAMPTZ: normalised to UTC, +00:00     → "2006-01-02 15:04:05[.ffffff]+00:00"
+//   - DATE:        date only                     → "2006-01-02"
+//   - TIMETZ:      normalised to UTC, +00:00     → "15:04:05[.ffffff]+00:00"
+//   - TIME:        time only, no offset          → "15:04:05[.ffffff]"
+//
+// Trailing fractional zeros are stripped in all cases.
 func formatTimeValue(t time.Time, typeName string) string {
 	switch strings.ToUpper(typeName) {
 	case "TIMESTAMPTZ":
+		// AWS Data API always returns TIMESTAMPTZ normalised to UTC with no
+		// offset suffix. The value is UTC but the format is identical to
+		// TIMESTAMP so Python (and other clients) receive a naive datetime
+		// string and can do arithmetic across both column types without a
+		// TypeError from mixing aware and naive datetimes.
 		t = t.UTC()
-		return stripTrailingZeros(t.Format("2006-01-02 15:04:05.999999999"), true) + "+00:00"
+		return stripTrailingZeros(t.Format("2006-01-02 15:04:05.999999999"), true)
 
 	case "TIMESTAMP":
 		return stripTrailingZeros(t.Format("2006-01-02 15:04:05.999999999"), true)
@@ -215,8 +485,9 @@ func formatTimeValue(t time.Time, typeName string) string {
 		return t.Format("2006-01-02")
 
 	case "TIMETZ":
+		// Same reasoning as TIMESTAMPTZ: normalise to UTC, no offset suffix.
 		t = t.UTC()
-		return stripTrailingZeros(t.Format("15:04:05.999999999"), true) + "+00:00"
+		return stripTrailingZeros(t.Format("15:04:05.999999999"), true)
 
 	case "TIME":
 		return stripTrailingZeros(t.Format("15:04:05.999999999"), true)
@@ -244,78 +515,33 @@ func stripTrailingZeros(s string, removeDot bool) string {
 	return s[:end]
 }
 
-// scanRowToFields scans the current row into a slice of Fields.
+// ── row scanning ──────────────────────────────────────────────────────────────
+
+// scanRowToFields decodes the current row into a slice of AWS Data API Fields.
+// It uses rows.Values() so that pgx's registered codec handles all type
+// decoding; the column OID is used only to drive time and array formatting.
 func scanRowToFields(rows pgx.Rows, descs []pgconn.FieldDescription) ([]Field, error) {
-	dests := make([]any, len(descs))
-	for i, fd := range descs {
-		dests[i] = makeScanDest(oidTypeName(fd.DataTypeOID))
+	values, err := rows.Values()
+	if err != nil {
+		return nil, fmt.Errorf("row values: %w", err)
 	}
-	if err := rows.Scan(dests...); err != nil {
-		return nil, fmt.Errorf("row scan: %w", err)
-	}
-	fields := make([]Field, len(descs))
-	for i, dest := range dests {
-		fields[i] = destToField(dest, oidTypeName(descs[i].DataTypeOID))
+	fields := make([]Field, len(values))
+	for i, v := range values {
+		fields[i] = valueToField(v, oidTypeName(descs[i].DataTypeOID))
 	}
 	return fields, nil
 }
 
-// scanRowToMap scans the current row into a map[string]any for the
+// scanRowToMap decodes the current row into a map[string]any for the
 // formatRecordsAs=JSON path.
 func scanRowToMap(rows pgx.Rows, descs []pgconn.FieldDescription) (map[string]any, error) {
-	dests := make([]any, len(descs))
-	for i, fd := range descs {
-		dests[i] = makeScanDest(oidTypeName(fd.DataTypeOID))
+	values, err := rows.Values()
+	if err != nil {
+		return nil, fmt.Errorf("row values: %w", err)
 	}
-	if err := rows.Scan(dests...); err != nil {
-		return nil, fmt.Errorf("row scan: %w", err)
-	}
-	row := make(map[string]any, len(descs))
+	row := make(map[string]any, len(values))
 	for i, fd := range descs {
-		row[fd.Name] = destToNative(dests[i], oidTypeName(fd.DataTypeOID))
+		row[fd.Name] = nativeValue(values[i], oidTypeName(fd.DataTypeOID))
 	}
 	return row, nil
-}
-
-// destToNative converts a scan destination to a plain Go value for JSON output.
-func destToNative(dest any, typeName string) any {
-	switch v := dest.(type) {
-	case *sql.NullInt64:
-		if !v.Valid {
-			return nil
-		}
-		return v.Int64
-	case *sql.NullFloat64:
-		if !v.Valid {
-			return nil
-		}
-		return v.Float64
-	case *sql.NullBool:
-		if !v.Valid {
-			return nil
-		}
-		return v.Bool
-	case *[]byte:
-		if *v == nil {
-			return nil
-		}
-		return json.RawMessage(*v)
-	case *sql.NullTime:
-		if !v.Valid {
-			return nil
-		}
-		return formatTimeValue(v.Time, typeName)
-	case *pgtype.Time:
-		if !v.Valid {
-			return nil
-		}
-		t := time.Time{}.Add(time.Duration(v.Microseconds) * time.Microsecond)
-		return formatTimeValue(t, typeName)
-	case *sql.NullString:
-		if !v.Valid {
-			return nil
-		}
-		return v.String
-	}
-	return nil
 }
