@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"log"
 	"net/http"
 	"strings"
 
@@ -51,6 +53,8 @@ func (h *Handler) rollbackTransaction(ctx context.Context, req dataapi.RollbackT
 }
 
 func (h *Handler) execute(ctx context.Context, req dataapi.ExecuteStatementRequest) (any, error) {
+	log.Printf("[query] %s", req.SQL)
+
 	if strings.TrimSpace(req.TransactionID) != "" {
 		tx, err := h.txStore.Get(req.TransactionID)
 		if err != nil {
@@ -60,6 +64,7 @@ func (h *Handler) execute(ctx context.Context, req dataapi.ExecuteStatementReque
 		if err != nil {
 			return nil, badRequest(err.Error())
 		}
+		logExecuteResponse(resp)
 		return resp, nil
 	}
 
@@ -67,10 +72,13 @@ func (h *Handler) execute(ctx context.Context, req dataapi.ExecuteStatementReque
 	if err != nil {
 		return nil, badRequest(err.Error())
 	}
+	logExecuteResponse(resp)
 	return resp, nil
 }
 
 func (h *Handler) batchExecute(ctx context.Context, req dataapi.BatchExecuteStatementRequest) (any, error) {
+	log.Printf("[query] %s", req.SQL)
+
 	if req.ParameterSets == nil {
 		req.ParameterSets = [][]dataapi.SQLParameter{}
 	}
@@ -84,6 +92,7 @@ func (h *Handler) batchExecute(ctx context.Context, req dataapi.BatchExecuteStat
 		if err != nil {
 			return nil, badRequest(err.Error())
 		}
+		logBatchResponse(resp)
 		return resp, nil
 	}
 
@@ -104,5 +113,47 @@ func (h *Handler) batchExecute(ctx context.Context, req dataapi.BatchExecuteStat
 		return nil, internalError(err.Error())
 	}
 
+	logBatchResponse(resp)
 	return resp, nil
+}
+
+// ── logging helpers ───────────────────────────────────────────────────────────
+
+// logExecuteResponse logs the full response body when the result set contains
+// fewer than 20 rows — enough to be useful in development without flooding the
+// log. Larger result sets emit a one-line summary instead.
+func logExecuteResponse(resp *dataapi.ExecuteStatementResponse) {
+	var count int
+	if resp.FormattedRecords != "" {
+		// FormattedRecords is a JSON array string; unmarshal just to count rows.
+		var rows []json.RawMessage
+		if err := json.Unmarshal([]byte(resp.FormattedRecords), &rows); err == nil {
+			count = len(rows)
+		}
+	} else {
+		count = len(resp.Records)
+	}
+
+	if count >= 20 {
+		log.Printf("[response] %d records (omitted)", count)
+		return
+	}
+
+	b, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("[response] (marshal error: %v)", err)
+		return
+	}
+	log.Printf("[response] %s", b)
+}
+
+// logBatchResponse logs the full batch response. Batch results only carry
+// generated-field slices (never row data), so they are always compact.
+func logBatchResponse(resp *dataapi.BatchExecuteStatementResponse) {
+	b, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("[response] (marshal error: %v)", err)
+		return
+	}
+	log.Printf("[response] %s", b)
 }

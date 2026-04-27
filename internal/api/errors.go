@@ -42,10 +42,16 @@ type ErrorResponse struct {
 }
 
 // writeJSON writes v as a JSON response with the given HTTP status code.
+// HTML escaping is explicitly disabled so that characters like <, >, and &
+// are written as-is rather than being replaced with \u003c / \u003e / \u0026.
+// This is important for the formattedRecords field, which embeds a JSON string
+// that would otherwise be mangled before reaching the caller.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(v)
 }
 
 // writeError writes a structured AWS-compatible error response.

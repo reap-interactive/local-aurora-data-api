@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/reap-interactive/local-aurora-data-api/internal/dataapi"
@@ -169,5 +170,66 @@ func TestHandler_ContentTypeIsJSON(t *testing.T) {
 	ct := w.Header().Get("Content-Type")
 	if ct != "application/json" {
 		t.Errorf("Content-Type: got %q, want application/json", ct)
+	}
+}
+
+// ── HTML escaping ───────────────────────────────────────────────────────────────
+
+// TestWriteJSON_NoHTMLEscaping verifies that writeJSON never replaces <, >, or
+// & with their \uXXXX unicode escape sequences. Go's json.Encoder does this by
+// default to guard against XSS in HTML contexts, but this server emits
+// application/json consumed by AWS SDK clients that expect literal characters.
+func TestWriteJSON_NoHTMLEscaping(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeJSON(w, http.StatusOK, map[string]string{"msg": "<hello> & world"})
+
+	body := w.Body.String()
+	for _, escaped := range []string{`\u003c`, `\u003e`, `\u0026`} {
+		if strings.Contains(body, escaped) {
+			t.Errorf("response body contains HTML escape %q: %s", escaped, body)
+		}
+	}
+	if !strings.Contains(body, "<hello> & world") {
+		t.Errorf("response body missing raw characters: %s", body)
+	}
+}
+
+// TestWriteJSON_FormattedRecordsNotEscaped specifically tests the formattedRecords
+// field, which embeds a JSON array as a string value. Any <, >, or & inside that
+// embedded JSON must survive the outer encoding untouched so the caller can
+// unmarshal the string directly.
+func TestWriteJSON_FormattedRecordsNotEscaped(t *testing.T) {
+	w := httptest.NewRecorder()
+	resp := dataapi.ExecuteStatementResponse{
+		FormattedRecords: `[{"name":"<test>","filter":"a & b"}]`,
+	}
+	writeJSON(w, http.StatusOK, resp)
+
+	body := w.Body.String()
+	for _, escaped := range []string{`\u003c`, `\u003e`, `\u0026`} {
+		if strings.Contains(body, escaped) {
+			t.Errorf("formattedRecords was HTML-escaped (%q found): %s", escaped, body)
+		}
+	}
+	// The literal embedded JSON must be present verbatim in the output.
+	if !strings.Contains(body, `<test>`) || !strings.Contains(body, `a & b`) {
+		t.Errorf("formattedRecords content missing from body: %s", body)
+	}
+}
+
+// TestWriteError_NoHTMLEscaping verifies that error messages containing HTML
+// special characters are also written without escaping.
+func TestWriteError_NoHTMLEscaping(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeError(w, http.StatusBadRequest, ErrBadRequest, `column <id> not found & check schema`)
+
+	body := w.Body.String()
+	for _, escaped := range []string{`\u003c`, `\u003e`, `\u0026`} {
+		if strings.Contains(body, escaped) {
+			t.Errorf("error message was HTML-escaped (%q found): %s", escaped, body)
+		}
+	}
+	if !strings.Contains(body, "<id>") {
+		t.Errorf("error message missing raw characters: %s", body)
 	}
 }
