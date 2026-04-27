@@ -6,9 +6,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/reap-interactive/local-aurora-data-api/internal/dataapi"
@@ -97,6 +99,25 @@ func testTable(t *testing.T, srv *httptest.Server, ddl string, fn func()) {
 		}, nil)
 	})
 	fn()
+}
+
+// apiPostBytes sends a POST request to path and returns the HTTP status code
+// together with the raw (undecoded) response body bytes. Use this instead of
+// apiPost whenever the test needs to inspect the literal wire representation
+// (e.g. to assert that HTML characters are not unicode-escaped).
+func apiPostBytes(t *testing.T, srv *httptest.Server, path string, body any) (int, []byte) {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	resp, err := http.Post(srv.URL+path, "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("POST %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body from %s: %v", path, err)
+	}
+	return resp.StatusCode, raw
 }
 
 // ── SELECT ────────────────────────────────────────────────────────────────────
@@ -341,6 +362,37 @@ func TestIntegration_BatchExecute(t *testing.T) {
 			t.Errorf("expected 3 rows, got %d", len(selResp.Records))
 		}
 	})
+}
+
+// ── HTML escaping ────────────────────────────────────────────────────────────
+
+// TestIntegration_FormattedRecords_NoHTMLEscaping verifies the full pipeline:
+// executor (json.Encoder with SetEscapeHTML(false)) → writeJSON. A SELECT that
+// returns string values containing <, >, and & must produce a response body
+// with those characters written literally, not as \u003c / \u003e / \u0026.
+func TestIntegration_FormattedRecords_NoHTMLEscaping(t *testing.T) {
+	_, srv := integrationHandler(t)
+
+	status, raw := apiPostBytes(t, srv, "/Execute", dataapi.ExecuteStatementRequest{
+		ResourceArn:     testResourceArn(),
+		SecretArn:       testSecretArn(),
+		SQL:             `SELECT '<b>hello</b> & world' AS msg`,
+		FormatRecordsAs: "JSON",
+	})
+
+	if status != http.StatusOK {
+		t.Fatalf("status: %d, body: %s", status, raw)
+	}
+
+	body := string(raw)
+	for _, escaped := range []string{`\u003c`, `\u003e`, `\u0026`} {
+		if strings.Contains(body, escaped) {
+			t.Errorf("response contains HTML escape %q: %s", escaped, body)
+		}
+	}
+	if !strings.Contains(body, "<b>hello</b>") || !strings.Contains(body, "& world") {
+		t.Errorf("response missing raw HTML characters: %s", body)
+	}
 }
 
 // ── Error cases ───────────────────────────────────────────────────────────────

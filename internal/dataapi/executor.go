@@ -1,9 +1,11 @@
 package dataapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -73,11 +75,15 @@ func Execute(ctx context.Context, q Querier, req *ExecuteStatementRequest) (*Exe
 		if err := rows.Err(); err != nil {
 			return nil, err
 		}
-		b, err := json.Marshal(rowMaps)
-		if err != nil {
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(rowMaps); err != nil {
 			return nil, fmt.Errorf("marshal formattedRecords: %w", err)
 		}
-		resp.FormattedRecords = string(b)
+		// json.Encoder.Encode appends a trailing newline; strip it so the value
+		// is a clean JSON array string, not a JSON array followed by '\n'.
+		resp.FormattedRecords = strings.TrimRight(buf.String(), "\n")
 	} else {
 		records := make([][]Field, 0)
 		for rows.Next() {
